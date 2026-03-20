@@ -9,8 +9,37 @@ short_rates = pd.read_excel("statsobligationer_data.xlsx", sheet_name = "korta r
 kpi = pd.read_excel("kpi_data.xlsx", sheet_name = "basår 1980")
 kpi_exp = pd.read_excel("CPI_Inflation_Expectations.xlsx", sheet_name = "CPI Expectations")
 
-START = pd.Timestamp("2005-10-01")
+START = pd.Timestamp("2004-01-30")
 END = pd.Timestamp("2025-12-31")
+
+MAX_MAT = 30
+MIN_MAT = 1.5
+
+#HELPER_PRICE_MODE = "standard_real"
+HELPER_PRICE_MODE = "lag_adjusted"
+ENTER_DATE = "2025-12-31"
+
+# region FIXED SETUP OPTIONS
+
+B0_MIN, B0_MAX = -0.03, 0.06
+B1_MIN, B1_MAX = -0.15, 0.15
+B2_MIN, B2_MAX = -0.05, 0.05
+
+TAU_MIN, TAU_MAX = 1.5, 8.0
+
+L2_0 = 10.0
+L2_1 = 10.0
+L2_2 = 0.2
+L2_3 = 0.05
+
+ACCURACY = 1.0e-10
+MAX_EVALUTATIONS = 10000
+SIMPLEX_LAMBDA = 0.005
+
+B2_GRID = [-0.02, -0.01, 0.0, 0.01, 0.02]
+TAU_GRID = [1.5, 2.0, 3.0, 4.5, 6.0]
+
+# endregion
 
 # region PREPARE BOND DATA
 
@@ -24,6 +53,8 @@ keep_cols = [
     "Date",
     "PX_LAST",
     "YLD_YTM_MID",
+    "BID_YIELD",
+    "ASK_YIELD",
     "Kupong",
     "Issue date",
     "Maturity date",
@@ -39,10 +70,12 @@ df_SGBILs["Date"] = pd.to_datetime(df_SGBILs["Date"], errors="coerce")
 df_SGBILs["Issue date"] = pd.to_datetime(df_SGBILs["Issue date"], errors="coerce")
 df_SGBILs["Maturity date"] = pd.to_datetime(df_SGBILs["Maturity date"], errors="coerce")
 
-for col in ["PX_LAST", "YLD_YTM_MID", "Kupong", "BasKPI"]:
+for col in ["PX_LAST", "YLD_YTM_MID", "BID_YIELD", "ASK_YIELD", "Kupong", "BasKPI"]:
     df_SGBILs[col] = pd.to_numeric(df_SGBILs[col], errors="coerce")
 
 df_SGBILs["YLD_YTM_MID"] = df_SGBILs["YLD_YTM_MID"] / 100.0
+df_SGBILs["BID_YIELD"] = df_SGBILs["BID_YIELD"] / 100.0
+df_SGBILs["ASK_YIELD"] = df_SGBILs["ASK_YIELD"] / 100.0
 df_SGBILs["Kupong"] = df_SGBILs["Kupong"] / 100.0
 
 # Rename columns:
@@ -50,6 +83,8 @@ df_SGBILs = df_SGBILs.rename(columns={
     "Date": "date",
     "PX_LAST": "price",
     "YLD_YTM_MID": "yield_quoted",
+    "BID_YIELD": "bid_yield_quoted",
+    "ASK_YIELD": "ask_yield_quoted",
     "Kupong": "coupon",
     "Issue date": "issue_date",
     "Maturity date": "maturity_date",
@@ -68,8 +103,8 @@ df_SGBILs = df_SGBILs.loc[df_SGBILs["serie"] != 3103].copy()
 # Keep only bonds in the real curve estimation range
 time_to_maturity = (df_SGBILs["maturity_date"] - df_SGBILs["date"]).dt.days
 df_SGBILs = df_SGBILs.loc[
-    (time_to_maturity >= 2 * 365) &
-    (time_to_maturity <= 20 * 365)
+    (time_to_maturity >= MIN_MAT * 365.25) &
+    (time_to_maturity <= MAX_MAT * 365.25)
 ].reset_index(drop=True)
 
 # ---- 2) ALIGN RAW DATA TO SGB IL LAST TRADING DAY
@@ -95,46 +130,32 @@ df_deposit = (
     .reset_index(drop=True)
 )
 
-# T-bill zero-coupon yields
-tbill_cols = ["SSVX_1m", "SSVX_3m", "SSVX_6m"]
+# 1m nominal zero yield from nominal estimation
+nominal_zero = pd.read_excel("zero_yields_SGB.xlsx", sheet_name="zero_yields")
+nominal_zero["date"] = pd.to_datetime(nominal_zero["date"], errors="coerce")
+nominal_zero["y_1m"] = pd.to_numeric(nominal_zero["y_1m"], errors="coerce")
 
-df_tbill = short_rates.loc[:, ["date"] + tbill_cols].copy()
-df_tbill["date"] = pd.to_datetime(df_tbill["date"], errors="coerce")
-
-df_tbill = df_tbill.melt(
-    id_vars=["date"],
-    value_vars=tbill_cols,
-    var_name="serie",
-    value_name="yield_quoted"
-).dropna(subset=["yield_quoted"]).reset_index(drop=True)
-
-df_tbill["yield_quoted"] = pd.to_numeric(df_tbill["yield_quoted"], errors="coerce") / 100.0
-
-tenor_months = {
-    "SSVX_1m": 1,
-    "SSVX_3m": 3,
-    "SSVX_6m": 6,
-}
-df_tbill["months"] = df_tbill["serie"].map(tenor_months).astype("Int64")
-
+df_tbill = nominal_zero.loc[:, ["date", "y_1m"]].copy()
+df_tbill = df_tbill.rename(columns={"y_1m": "yield_quoted"})
+df_tbill["serie"] = "1m_zero"
 df_tbill["coupon"] = 0.0
 df_tbill["issue_date"] = df_tbill["date"]
-df_tbill["maturity_date"] = df_tbill["issue_date"] + pd.to_timedelta(df_tbill["months"] * 30, unit="D")
+df_tbill["maturity_date"] = df_tbill["issue_date"] + pd.to_timedelta(30, unit="D")
 df_tbill["isin"] = ""
 df_tbill["bas_kpi"] = np.nan
 
-# Zero-coupon prices from quoted yields
+# Zero-coupon price from quoted annualized yield
 days = (df_tbill["maturity_date"] - df_tbill["issue_date"]).dt.days
 t = days / 360.0
 df_tbill["price"] = 100.0 / (1.0 + df_tbill["yield_quoted"]) ** t
 
-# Align T-bills from EOM to SGB IL last trading day
+# Align 1m zero yield date to SGB IL last trading day
 df_tbill["month"] = df_tbill["date"].dt.to_period("M")
 df_tbill["date"] = df_tbill["month"].map(month_trading_date)
 df_tbill["issue_date"] = df_tbill["date"]
 
 df_tbill = (
-    df_tbill.drop(columns=["month", "months"])
+    df_tbill.drop(columns=["month"])
     .dropna(subset=["date", "price", "yield_quoted", "issue_date", "maturity_date"])
     .sort_values(["date", "maturity_date"])
     .reset_index(drop=True)
@@ -152,7 +173,7 @@ df_cpi["month"] = df_cpi["date"].dt.to_period("M")
 df_cpi["date"] = df_cpi["month"].map(month_trading_date)
 df_cpi = (
     df_cpi.drop(columns=["month"])
-    .dropna(subset=["date", "inflation year"])
+    .dropna(subset=["date"])
     .drop_duplicates(subset=["date"])
     .sort_values("date")
     .reset_index(drop=True)
@@ -223,7 +244,20 @@ df_cpi = (
     .reset_index(drop=True)
 )
 
-# ---- 5) PLOT SHORT-RATE ANCHOR ALTERNATIVES
+# CPI HELPERS:
+
+def backward_1y_inflation(inflation_year: pd.Series) -> pd.Series:
+    return inflation_year
+
+
+def forward_1y_inflation(inflation_year: pd.Series) -> pd.Series:
+    return inflation_year.shift(-12)
+
+
+def real_rate_from_1y_inflation(y_nominal: pd.Series, inflation_1y: pd.Series) -> pd.Series:
+    return y_nominal - inflation_1y
+
+    #region 5) PLOT SHORT-RATE ANCHOR ALTERNATIVES
 
 # Keep one macro dataframe for inflation and expectations
 df_anchor_plot = df_cpi.copy()
@@ -236,15 +270,13 @@ df_anchor_plot = pd.merge(
     how="left"
 )
 
-# Reshape T-bill data to wide format
+# Add 1m nominal zero
 df_tbill_plot = (
-    df_tbill.loc[:, ["date", "serie", "yield_quoted"]]
-    .drop_duplicates(subset=["date", "serie"])
-    .pivot(index="date", columns="serie", values="yield_quoted")
-    .reset_index()
+    df_tbill.loc[:, ["date", "yield_quoted"]]
+    .drop_duplicates(subset=["date"])
+    .rename(columns={"yield_quoted": "y_1m"})
 )
 
-# Merge T-bill rates into plotting dataframe
 df_anchor_plot = pd.merge(
     df_anchor_plot,
     df_tbill_plot,
@@ -252,18 +284,44 @@ df_anchor_plot = pd.merge(
     how="left"
 )
 
-# Construct alternative real short-rate proxies
-df_anchor_plot["deposit_minus_infl"] = df_anchor_plot["deposit"] - df_anchor_plot["inflation year"]
-
-df_anchor_plot["tbill_1m_minus_infl"] = df_anchor_plot["SSVX_1m"] - df_anchor_plot["inflation year"]
-df_anchor_plot["tbill_3m_minus_infl"] = df_anchor_plot["SSVX_3m"] - df_anchor_plot["inflation year"]
-df_anchor_plot["tbill_6m_minus_infl"] = df_anchor_plot["SSVX_6m"] - df_anchor_plot["inflation year"]
-
-df_anchor_plot["tbill_1m_minus_exp"] = df_anchor_plot["SSVX_1m"] - df_anchor_plot["cpi_exp_1y"]
-df_anchor_plot["tbill_3m_minus_exp"] = df_anchor_plot["SSVX_3m"] - df_anchor_plot["cpi_exp_1y"]
-df_anchor_plot["tbill_6m_minus_exp"] = df_anchor_plot["SSVX_6m"] - df_anchor_plot["cpi_exp_1y"]
-
 df_anchor_plot = df_anchor_plot.sort_values("date").reset_index(drop=True)
+
+# Inflation measures
+df_anchor_plot["infl_1y_back"] = backward_1y_inflation(df_anchor_plot["inflation year"])
+df_anchor_plot["infl_1y_fwd"] = forward_1y_inflation(df_anchor_plot["inflation year"])
+df_anchor_plot["infl_1y_exp"] = df_anchor_plot["cpi_exp_1y"]
+
+# Deposit: synthetic real rates
+df_anchor_plot["deposit_real_back"] = real_rate_from_1y_inflation(
+    df_anchor_plot["deposit"],
+    df_anchor_plot["infl_1y_back"]
+)
+
+df_anchor_plot["deposit_real_fwd"] = real_rate_from_1y_inflation(
+    df_anchor_plot["deposit"],
+    df_anchor_plot["infl_1y_fwd"]
+)
+
+df_anchor_plot["deposit_real_exp"] = real_rate_from_1y_inflation(
+    df_anchor_plot["deposit"],
+    df_anchor_plot["infl_1y_exp"]
+)
+
+# 1m zero: synthetic real rates
+df_anchor_plot["y1m_real_back"] = real_rate_from_1y_inflation(
+    df_anchor_plot["y_1m"],
+    df_anchor_plot["infl_1y_back"]
+)
+
+df_anchor_plot["y1m_real_fwd"] = real_rate_from_1y_inflation(
+    df_anchor_plot["y_1m"],
+    df_anchor_plot["infl_1y_fwd"]
+)
+
+df_anchor_plot["y1m_real_exp"] = real_rate_from_1y_inflation(
+    df_anchor_plot["y_1m"],
+    df_anchor_plot["infl_1y_exp"]
+)
 
 # ---- PLOT SETTINGS
 
@@ -277,89 +335,73 @@ plt.rcParams.update({
 })
 
 color_deposit = "#3A3A3A"
-color_1m = "#D55E00"
-color_3m = "#43AD73"  
-color_6m = "#3677C8"       
+color_1m = "#2CA02C" 
 
 fig, ax = plt.subplots(figsize=(8.2, 4.8))
 fig.patch.set_facecolor("white")
 ax.set_facecolor("white")
 
-# Deposit minus realized inflation
+# Deposit
 ax.plot(
     df_anchor_plot["date"],
-    100.0 * df_anchor_plot["deposit_minus_infl"],
+    100.0 * df_anchor_plot["deposit_real_back"],
     color=color_deposit,
-    linewidth=1.8,
+    linewidth=1.7,
     linestyle="-",
-    label="Deposit - 1y realized"
+    label="Deposit - 1y backward"
 )
 
-# 1m T-bill
 ax.plot(
     df_anchor_plot["date"],
-    100.0 * df_anchor_plot["tbill_1m_minus_infl"],
+    100.0 * df_anchor_plot["deposit_real_fwd"],
+    color=color_deposit,
+    linewidth=1.7,
+    linestyle="-.",
+    label="Deposit - 1y forward"
+)
+
+ax.plot(
+    df_anchor_plot["date"],
+    100.0 * df_anchor_plot["deposit_real_exp"],
+    color=color_deposit,
+    linewidth=2.2,
+    linestyle=":",
+    label="Deposit - 1y expected"
+)
+
+# 1m zero
+ax.plot(
+    df_anchor_plot["date"],
+    100.0 * df_anchor_plot["y1m_real_back"],
     color=color_1m,
-    linewidth=1.8,
-    alpha=0.85,
+    linewidth=1.7,
     linestyle="-",
-    label="1m T-bill - 1y realized"
+    label="1m zero - 1y backward"
 )
 
 ax.plot(
     df_anchor_plot["date"],
-    100.0 * df_anchor_plot["tbill_1m_minus_exp"],
+    100.0 * df_anchor_plot["y1m_real_fwd"],
+    color=color_1m,
+    linewidth=1.7,
+    linestyle="-.",
+    label="1m zero - 1y forward"
+)
+
+ax.plot(
+    df_anchor_plot["date"],
+    100.0 * df_anchor_plot["y1m_real_exp"],
     color=color_1m,
     linewidth=2.2,
     linestyle=":",
-    label="1m T-bill - 1y expected"
-)
-
-# 3m T-bill
-ax.plot(
-    df_anchor_plot["date"],
-    100.0 * df_anchor_plot["tbill_3m_minus_infl"],
-    color=color_3m,
-    linewidth=1.8,
-    alpha=0.85,
-    linestyle="-",
-    label="3m T-bill - 1y realized"
-)
-
-ax.plot(
-    df_anchor_plot["date"],
-    100.0 * df_anchor_plot["tbill_3m_minus_exp"],
-    color=color_3m,
-    linewidth=2.2,
-    linestyle=":",
-    label="3m T-bill - 1y expected"
-)
-
-# 6m T-bill
-ax.plot(
-    df_anchor_plot["date"],
-    100.0 * df_anchor_plot["tbill_6m_minus_infl"],
-    color=color_6m,
-    linewidth=1.8,
-    alpha=0.85,
-    linestyle="-",
-    label="6m T-bill - 1y realized"
-)
-
-ax.plot(
-    df_anchor_plot["date"],
-    100.0 * df_anchor_plot["tbill_6m_minus_exp"],
-    color=color_6m,
-    linewidth=2.2,
-    linestyle=":",
-    label="6m T-bill - 1y expected"
+    label="1m zero - 1y expected"
 )
 
 ax.axhline(0.0, color="black", linestyle=":", linewidth=1.0)
 
 ax.set_xlabel("Date")
-ax.set_ylabel("money market rate - inflation (pp)")
-ax.set_title("", pad=12)
+ax.set_ylabel("Real rate (%)")
+ax.set_title("Real short rate alternatives", pad=12)
 
 for spine in ax.spines.values():
     spine.set_linewidth(1.0)
@@ -392,59 +434,30 @@ ax.legend(
 plt.tight_layout()
 plt.show()
 
-# ---- 6) BUILD REAL SHORT-RATE INSTRUMENTS
+    # endregion
 
-# Real deposit series: deposit - realized inflation
-df_real_deposit = pd.merge(
-    df_deposit,
-    df_cpi.loc[:, ["date", "inflation year"]],
-    on="date",
-    how="inner"
-)
+# ---- 6) BUILD 1M EXPECTATION-ADJUSTED START ANCHOR SERIES
 
-df_real_deposit["real_deposit"] = (
-    df_real_deposit["deposit"] - df_real_deposit["inflation year"]
-)
-
-df_real_deposit = (
-    df_real_deposit.loc[:, ["date", "real_deposit"]]
-    .dropna(subset=["date", "real_deposit"])
-    .drop_duplicates(subset=["date"])
-    .sort_values("date")
-    .reset_index(drop=True)
-)
-
-# Real T-bill instruments: nominal T-bill yield - 1y expected inflation
-df_tbill_real = pd.merge(
-    df_tbill,
+df_anchor_1m_exp = pd.merge(
+    df_tbill.loc[:, ["date", "yield_quoted"]],
     df_cpi.loc[:, ["date", "cpi_exp_1y"]],
     on="date",
     how="left"
 )
 
-df_tbill_real["yield_quoted"] = (
-    df_tbill_real["yield_quoted"] - df_tbill_real["cpi_exp_1y"]
+df_anchor_1m_exp["real_1m_exp"] = (
+    df_anchor_1m_exp["yield_quoted"] - df_anchor_1m_exp["cpi_exp_1y"]
 )
 
-df_tbill_real["serie"] = df_tbill_real["serie"].map({
-    "SSVX_1m": "1m_real",
-    "SSVX_3m": "3m_real",
-    "SSVX_6m": "6m_real",
-})
-
-days = (df_tbill_real["maturity_date"] - df_tbill_real["issue_date"]).dt.days
-t = days / 360.0
-df_tbill_real["price"] = 100.0 / (1.0 + df_tbill_real["yield_quoted"]) ** t
-
-df_tbill_real = (
-    df_tbill_real.loc[:, [
-        "date", "price", "yield_quoted", "coupon",
-        "issue_date", "maturity_date", "isin", "serie", "bas_kpi"
-    ]]
-    .dropna(subset=["date", "price", "yield_quoted", "issue_date", "maturity_date", "serie"])
-    .sort_values(["date", "maturity_date"])
+df_anchor_1m_exp = (
+    df_anchor_1m_exp.loc[:, ["date", "real_1m_exp"]]
+    .dropna(subset=["date", "real_1m_exp"])
+    .drop_duplicates(subset=["date"])
+    .sort_values("date")
     .reset_index(drop=True)
 )
+
+df_SGBILs = df_SGBILs.drop(columns=["month"], errors="ignore")
 
 df_SGBILs = df_SGBILs.drop(columns=["month"], errors="ignore")
 
@@ -487,6 +500,71 @@ def swedish_reference_kpi(
 
     return kpi_0 + (day - 1) / 30.0 * (kpi_1 - kpi_0)
 
+
+# ---- FUNCTION: PREPARE HELPER INPUTS
+
+def eval_month_cpi(
+    eval_date: pd.Timestamp,
+    kpi_by_month: pd.Series,
+) -> float:
+    """
+    Monthly CPI for the eval-date month.
+    Example: if eval_date is 2025-12-31, use CPI for 2025-12.
+    """
+    cpi_month = eval_date.to_period("M")
+
+    if cpi_month not in kpi_by_month.index:
+        raise ValueError(f"Missing CPI for eval-date month: {cpi_month}")
+
+    return float(kpi_by_month.loc[cpi_month])
+
+
+def prepare_helper_prices(
+    cross_section: pd.DataFrame,
+    eval_date: pd.Timestamp,
+    settlement_date: pd.Timestamp,
+    kpi_by_month: pd.Series,
+    helper_price_mode: str = "standard_real",
+) -> tuple[pd.DataFrame, float, float, str]:
+
+    cs = cross_section.copy()
+
+    # Standard Swedish market-convention reference KPI:
+    # 3-month lag with linear interpolation at settlement date
+    reference_kpi = swedish_reference_kpi(
+        settlement_date,
+        kpi_by_month,
+        lag_months=3
+    )
+
+    # CPI of the eval-date month
+    eval_month_kpi = eval_month_cpi(
+        eval_date,
+        kpi_by_month
+    )
+
+    # Standard real price: current script behavior
+    cs["index_factor"] = reference_kpi / cs["bas_kpi"]
+    cs["real_price"] = cs["price"] / cs["index_factor"]
+
+    # Lag-adjusted price: divide by eval-month CPI / base CPI
+    cs["index_factor_lag_adj"] = eval_month_kpi / cs["bas_kpi"]
+    cs["real_price_lag_adj"] = cs["price"] / cs["index_factor_lag_adj"]
+
+    if helper_price_mode == "standard_real":
+        price_col = "real_price"
+    elif helper_price_mode == "lag_adjusted":
+        price_col = "real_price_lag_adj"
+    else:
+        raise ValueError(
+            f"Unknown HELPER_PRICE_MODE: {helper_price_mode}. "
+            f"Use 'standard_real' or 'lag_adjusted'."
+        )
+
+    cs["price_for_helper"] = cs[price_col]
+
+    return cs, reference_kpi, eval_month_kpi, price_col
+
 # endregion
 
 # region CROSS SECTION 
@@ -495,7 +573,6 @@ def swedish_reference_kpi(
 
 # ---- 1) SETTINGS
 
-ENTER_DATE = "2022-12-30"
 eval_date = pd.Timestamp(ENTER_DATE)
 
 cross_section = df_SGBILs.loc[df_SGBILs["date"] == eval_date].copy()
@@ -519,7 +596,7 @@ settlement_days = 2
 face = 100.0
 redemption = 100.0
 
-# ---- 4) REFERENCE KPI
+# ---- 4) REFERENCE KPI + HELPER PRICES 
 
 ql_settlement_date = calendar.advance(ql_eval_date, settlement_days, ql.Days)
 settlement_date = pd.Timestamp(
@@ -528,12 +605,18 @@ settlement_date = pd.Timestamp(
     ql_settlement_date.dayOfMonth()
 )
 
-reference_kpi = swedish_reference_kpi(settlement_date, kpi_by_month, lag_months=3)
+cross_section, reference_kpi, eval_month_kpi, price_col = prepare_helper_prices(
+    cross_section=cross_section,
+    eval_date=eval_date,
+    settlement_date=settlement_date,
+    kpi_by_month=kpi_by_month,
+    helper_price_mode=HELPER_PRICE_MODE,
+)
 
-# ---- 5) REAL PRICES
-
-cross_section["index_factor"] = reference_kpi / cross_section["bas_kpi"]
-cross_section["real_price"] = cross_section["price"] / cross_section["index_factor"]
+print(f"HELPER_PRICE_MODE = {HELPER_PRICE_MODE}")
+print(f"Using helper price column: {price_col}")
+print(f"reference_kpi = {reference_kpi:.6f}")
+print(f"eval_month_kpi = {eval_month_kpi:.6f}")
 
 # ---- 6) REAL YIELDS
 
@@ -556,7 +639,7 @@ for _, row in cross_section.iterrows():
         day_count, business_convention, redemption, ql_issue
     )
 
-    price_obj = ql.BondPrice(float(row["real_price"]), ql.BondPrice.Clean)
+    price_obj = ql.BondPrice(float(row["price_for_helper"]), ql.BondPrice.Clean)
 
     ytm_real = ql.BondFunctions.bondYield(
         bond, price_obj, day_count,
@@ -595,7 +678,7 @@ for _, row in cross_section.iterrows():
     )
 
     helper = ql.FixedRateBondHelper(
-        ql.QuoteHandle(ql.SimpleQuote(float(row["real_price"]))),
+        ql.QuoteHandle(ql.SimpleQuote(float(row["price_for_helper"]))),
         settlement_days, face, schedule,
         [float(row["coupon"])],
         day_count, business_convention, redemption, ql_issue
@@ -603,7 +686,7 @@ for _, row in cross_section.iterrows():
 
     bonds_actual.append(bond)
     helpers_actual.append(helper)
-    quoted_price_actual.append(float(row["real_price"]))
+    quoted_price_actual.append(float(row["price_for_helper"]))
     yield_real_actual.append(float(row["yield_real"]))
     maturities_actual.append(row["maturity_date"])
 
@@ -613,56 +696,18 @@ maturities_actual = pd.to_datetime(maturities_actual)
 
 print("Actual helpers built:", len(helpers_actual))
 
-# ---- 8) 6M REAL T-BILL ANCHOR
-
-tbill_6m_row = df_tbill_real.loc[
-    (df_tbill_real["date"] == eval_date) &
-    (df_tbill_real["serie"] == "6m_real")
-].copy()
-
-if tbill_6m_row.empty:
-    raise ValueError(f"No 6m real T-bill anchor found for {eval_date.date()}")
-
-tbill_6m_row = tbill_6m_row.iloc[0]
-
-real_6m_rate = float(tbill_6m_row["yield_quoted"])
-real_6m_price = float(tbill_6m_row["price"])
-
-real_6m_issue_date = pd.Timestamp(tbill_6m_row["issue_date"])
-real_6m_maturity_date = pd.Timestamp(tbill_6m_row["maturity_date"])
-
-real_6m_rate_cc = np.log(1.0 + real_6m_rate)
-
-# ---- 9) ADD 6M HELPER
-
-ql_issue_6m = ql.Date(real_6m_issue_date.day, real_6m_issue_date.month, real_6m_issue_date.year)
-ql_maturity_6m = ql.Date(real_6m_maturity_date.day, real_6m_maturity_date.month, real_6m_maturity_date.year)
-
-schedule_6m = ql.Schedule(
-    ql_issue_6m, ql_maturity_6m,
-    ql.Period(ql.Once), calendar,
-    business_convention, business_convention,
-    ql.DateGeneration.Forward, False
-)
-
-tbill_6m_helper = ql.FixedRateBondHelper(
-    ql.QuoteHandle(ql.SimpleQuote(real_6m_price)),
-    settlement_days, face, schedule_6m,
-    [0.0], day_count,
-    business_convention, redemption, ql_issue_6m
-)
-
-helpers_actual_6m = helpers_actual + [tbill_6m_helper]
-
-# ---- 10) PRE-CURVE + SYNTHETICS
+# ---- 10) BUILD SYNTHETIC HELPERS
 
 pre_curve = ql.PiecewiseLogCubicDiscount(
-    settlement_days, calendar, helpers_actual_6m, day_count
+    settlement_days,
+    calendar,
+    helpers_actual,
+    day_count
 )
 pre_curve.enableExtrapolation()
 
 actual_maturity_dates = sorted({b.maturityDate() for b in bonds_actual})
-curve_nodes = sorted({ql_maturity_6m, *actual_maturity_dates})
+curve_nodes = actual_maturity_dates.copy()
 
 synthetic_helpers = []
 
@@ -686,23 +731,31 @@ for d1, d2 in zip(curve_nodes[:-1], curve_nodes[1:]):
     price_mid = face * pre_curve.discount(mid_date)
 
     schedule_mid = ql.Schedule(
-        curve_reference_date, mid_date,
-        ql.Period(ql.Once), calendar,
-        business_convention, business_convention,
-        ql.DateGeneration.Forward, False
+        curve_reference_date,
+        mid_date,
+        ql.Period(ql.Once),
+        calendar,
+        business_convention,
+        business_convention,
+        ql.DateGeneration.Forward,
+        False
     )
 
     helper = ql.FixedRateBondHelper(
         ql.QuoteHandle(ql.SimpleQuote(price_mid)),
-        settlement_days, face, schedule_mid,
-        [0.0], day_count,
-        business_convention, redemption,
+        settlement_days,
+        face,
+        schedule_mid,
+        [0.0],
+        day_count,
+        business_convention,
+        redemption,
         curve_reference_date
     )
 
     synthetic_helpers.append(helper)
 
-helpers_extended = helpers_actual_6m + synthetic_helpers
+helpers_extended = helpers_actual + synthetic_helpers
 
 print("Synthetic helpers:", len(synthetic_helpers))
 print("Total helpers:", len(helpers_extended))
@@ -713,17 +766,17 @@ print("Total helpers:", len(helpers_extended))
 
 # ---- DEPOSIT-BASED STARTING ANCHOR FOR b0 + b1
 
-real_deposit_row = df_real_deposit.loc[df_real_deposit["date"] == eval_date]
+anchor_1m_row = df_anchor_1m_exp.loc[df_anchor_1m_exp["date"] == eval_date]
 
-if real_deposit_row.empty:
-    raise ValueError(f"No real deposit anchor found for evaluation date {eval_date.date()}")
+if anchor_1m_row.empty:
+    raise ValueError(f"No 1m expected-inflation anchor found for evaluation date {eval_date.date()}")
 
-real_deposit_rate = float(real_deposit_row["real_deposit"].iloc[0])
-real_deposit_rate_cc = np.log(1.0 + real_deposit_rate)
+real_1m_exp_rate = float(anchor_1m_row["real_1m_exp"].iloc[0])
+real_1m_exp_rate_cc = np.log(1.0 + real_1m_exp_rate)
 
 print(
-    f"Deposit-based start anchor: simple={real_deposit_rate:.6f}, "
-    f"cc={real_deposit_rate_cc:.6f}"
+    f"1m expected-inflation start anchor: simple={real_1m_exp_rate:.6f}, "
+    f"cc={real_1m_exp_rate_cc:.6f}"
 )
 
 # ---- 1) ANCHORS
@@ -732,20 +785,21 @@ max_maturity = max(b.maturityDate() for b in bonds_actual)
 long_rate_cc = pre_curve.zeroRate(max_maturity, day_count, ql.Continuous).rate()
 
 b0 = long_rate_cc
-b1 = real_deposit_rate_cc - b0
+
+b1 = real_1m_exp_rate_cc - b0
 
 print(
-    f"Start anchors: short={real_deposit_rate_cc:.6f}, "
+    f"Start anchors: short={real_1m_exp_rate_cc:.6f}, "
     f"long={long_rate_cc:.6f}, b0={b0:.6f}, b1={b1:.6f}"
 )
 
 # ---- 2) BOUNDS
 
-b0_min, b0_max = -0.03, 0.06
-b1_min, b1_max = -0.15, 0.15
-b2_min, b2_max = -0.05, 0.05
+b0_min, b0_max = B0_MIN, B0_MAX
+b1_min, b1_max = B1_MIN, B1_MAX
+b2_min, b2_max = B2_MIN, B2_MAX
 
-tau_min, tau_max = 1.5, 8.0
+tau_min, tau_max = TAU_MIN, TAU_MAX
 kappa_min, kappa_max = 1.0 / tau_max, 1.0 / tau_min
 
 lower = ql.Array(4)
@@ -761,16 +815,16 @@ constraint = ql.NonhomogeneousBoundaryConstraint(lower, upper)
 # ---- 5) PENALTIES AROUND STARTING VALUES
 
 l2 = ql.Array(4)
-l2[0] = 0.05
-l2[1] = 0.001
-l2[2] = 0.2
-l2[3] = 0.05
+l2[0] = L2_0
+l2[1] = L2_1
+l2[2] = L2_2
+l2[3] = L2_3
 
 # ---- 4) FIT SETUP
 
-accuracy = 1.0e-10
-max_evaluations = 10000
-simplex_lambda = 0.005
+accuracy = ACCURACY
+max_evaluations = MAX_EVALUTATIONS
+simplex_lambda = SIMPLEX_LAMBDA
 
 fitting = ql.NelsonSiegelFitting(
     ql.Array(),
@@ -803,8 +857,8 @@ def price_actual_bonds(curve):
 
 # ---- 2) MULTISTART GRID
 
-b2_grid = [-0.02, -0.01, 0.0, 0.01, 0.02]
-tau_grid = [1.5, 2.0, 3.0, 4.5, 6.0]
+b2_grid = B2_GRID
+tau_grid = TAU_GRID
 
 # ---- 3) FUNCTION: FIT A SET OF HELPERS
 
@@ -859,14 +913,10 @@ def fit_one_helper_set(helpers, name):
 
     return best_curve, best_params, best_objective, best_start
 
-# ---- 4) FIT ACTUAL, ACTUAL+6M, AND EXTENDED SETS
+# ---- 4) FIT ACTUAL AND EXTENDED SETS
 
 best_curve_actual, best_params_actual, best_objective_actual, best_start_actual = fit_one_helper_set(
     helpers_actual, "ACTUAL"
-)
-
-best_curve_actual_6m, best_params_actual_6m, best_objective_actual_6m, best_start_actual_6m = fit_one_helper_set(
-    helpers_actual_6m, "ACTUAL+6M"
 )
 
 best_curve_ext, best_params_ext, best_objective_ext, best_start_ext = fit_one_helper_set(
@@ -876,14 +926,10 @@ best_curve_ext, best_params_ext, best_objective_ext, best_start_ext = fit_one_he
 # ---- 5) PRICE ACTUAL BONDS OF EACH CURVE
 
 model_prices_actual, model_yields_actual = price_actual_bonds(best_curve_actual)
-model_prices_actual_6m, model_yields_actual_6m = price_actual_bonds(best_curve_actual_6m)
 model_prices_ext, model_yields_ext = price_actual_bonds(best_curve_ext)
 
 rmse_price_actual = float(
     np.sqrt(np.mean((quoted_price_actual - model_prices_actual) ** 2))
-)
-rmse_price_actual_6m = float(
-    np.sqrt(np.mean((quoted_price_actual - model_prices_actual_6m) ** 2))
 )
 rmse_price_ext = float(
     np.sqrt(np.mean((quoted_price_actual - model_prices_ext) ** 2))
@@ -892,19 +938,14 @@ rmse_price_ext = float(
 rmse_yield_bp_actual = float(
     np.sqrt(np.mean((yield_real_actual - model_yields_actual) ** 2)) * 1e4
 )
-rmse_yield_bp_actual_6m = float(
-    np.sqrt(np.mean((yield_real_actual - model_yields_actual_6m) ** 2)) * 1e4
-)
 rmse_yield_bp_ext = float(
     np.sqrt(np.mean((yield_real_actual - model_yields_ext) ** 2)) * 1e4
 )
 
 print("NS MULTISTART RMSE price (actual-only fit):   ", rmse_price_actual)
-print("NS MULTISTART RMSE price (actual+6m fit):     ", rmse_price_actual_6m)
 print("NS MULTISTART RMSE price (extended fit):      ", rmse_price_ext)
 
 print("NS MULTISTART RMSE yield bp (actual-only fit):", rmse_yield_bp_actual)
-print("NS MULTISTART RMSE yield bp (actual+6m fit):  ", rmse_yield_bp_actual_6m)
 print("NS MULTISTART RMSE yield bp (extended fit):   ", rmse_yield_bp_ext)
 
     # endregion
@@ -930,17 +971,14 @@ times = np.arange(1.0 / 12.0, 35.0 + 1.0 / 12.0, 1.0 / 12.0)
 maturities_plot = pd.to_datetime(maturities_actual)
 
 color_actual = "#000000"
-color_actual_6m = "#7A7A7A"
 color_extended = "#0B1EFF"
 color_boot = "#E31A1C"
 color_observed = "#E31A1C"
-color_6m_point = "#FF5A0B"
 
 # ---- ZERO-COUPON CURVES
 
 times_used = []
 zero_actual = []
-zero_actual_6m = []
 zero_extended = []
 zero_boot = []
 
@@ -953,7 +991,6 @@ for t in times:
 
     times_used.append(months / 12.0)
     zero_actual.append(best_curve_actual.zeroRate(d, dc_plot, comp).rate())
-    zero_actual_6m.append(best_curve_actual_6m.zeroRate(d, dc_plot, comp).rate())
     zero_extended.append(best_curve_ext.zeroRate(d, dc_plot, comp).rate())
     zero_boot.append(pre_curve.zeroRate(d, dc_plot, comp).rate())
 
@@ -972,15 +1009,6 @@ ax.plot(
 
 ax.plot(
     times_used,
-    100.0 * np.array(zero_actual_6m),
-    color=color_actual_6m,
-    linewidth=2.7,
-    linestyle="-",
-    label="Actual + 6m real T-bill"
-)
-
-ax.plot(
-    times_used,
     100.0 * np.array(zero_extended),
     color=color_extended,
     linewidth=2.7,
@@ -993,7 +1021,7 @@ ax.plot(
     100.0 * np.array(zero_boot),
     color=color_boot,
     linewidth=2.0,
-    linestyle="--",
+    linestyle="-.",
     label="Bootstrapped"
 )
 
@@ -1003,8 +1031,7 @@ b0_pct = 100.0 * b0
 b0b1_pct = 100.0 * (b0 + b1)
 
 anchor_text = (
-    f"$b_0$ start: {b0_pct:.2f}%\n"
-    f"$b_0 + b_1$ start: {b0b1_pct:.2f}%"
+    f"Short rate anchor: {b0b1_pct:.2f}%"
 )
 
 ax.text(
@@ -1057,12 +1084,13 @@ ax.legend(
 )
 
 plt.tight_layout()
+ymin, ymax = plt.gca().get_ylim()
+plt.ylim(ymin - 0.0, ymax + 1.0)
 plt.show()
 
 # ---- PRICE RESIDUALS ON ACTUAL BONDS
 
 price_resid_actualfit = quoted_price_actual - model_prices_actual
-price_resid_actual6mfit = quoted_price_actual - model_prices_actual_6m
 price_resid_extfit = quoted_price_actual - model_prices_ext
 
 fig, ax = plt.subplots(figsize=(8.2, 4.8))
@@ -1082,17 +1110,6 @@ ax.scatter(
 
 ax.scatter(
     maturities_plot,
-    price_resid_actual6mfit,
-    s=60,
-    color=color_actual_6m,
-    marker="o",
-    edgecolor="black",
-    linewidth=0.4,
-    label="Actual + 6m real T-bill fit"
-)
-
-ax.scatter(
-    maturities_plot,
     price_resid_extfit,
     s=62,
     color=color_extended,
@@ -1100,17 +1117,6 @@ ax.scatter(
     edgecolor="black",
     linewidth=0.4,
     label="Extended fit"
-)
-
-ax.scatter(
-    pd.Timestamp(real_6m_maturity_date),
-    0.0,
-    s=78,
-    color=color_6m_point,
-    marker="^",
-    edgecolor="black",
-    linewidth=0.5,
-    label="6m real T-bill"
 )
 
 ax.axhline(0.0, color="black", linestyle="--", linewidth=1.0)
@@ -1177,17 +1183,6 @@ ax.scatter(
 
 ax.scatter(
     maturities_plot,
-    100.0 * model_yields_actual_6m,
-    s=60,
-    color=color_actual_6m,
-    marker="o",
-    edgecolor="black",
-    linewidth=0.4,
-    label="Actual + 6m real T-bill"
-)
-
-ax.scatter(
-    maturities_plot,
     100.0 * model_yields_ext,
     s=62,
     color=color_extended,
@@ -1197,20 +1192,9 @@ ax.scatter(
     label="Extended"
 )
 
-ax.scatter(
-    pd.Timestamp(real_6m_maturity_date),
-    100.0 * real_6m_rate,
-    s=82,
-    color=color_6m_point,
-    marker="D",
-    edgecolor="black",
-    linewidth=0.5,
-    label="6m real T-bill"
-)
-
 ax.set_xlabel("Maturity date")
 ax.set_ylabel("Yield to maturity (%)")
-ax.set_title(f"Observed vs. implied ({eval_date.date()})", pad=12)
+ax.set_title(f"Observed vs. estimated ({eval_date.date()})", pad=12)
 
 for spine in ax.spines.values():
     spine.set_linewidth(1.0)
@@ -1253,9 +1237,9 @@ plt.show()
 
 def run_estimation_for_date_multistart_ns(
     df_panel: pd.DataFrame,
-    df_real_deposit: pd.DataFrame,
-    df_tbill_real: pd.DataFrame,
-    eval_date: pd.Timestamp
+    df_anchor_1m_exp: pd.DataFrame,
+    eval_date: pd.Timestamp,
+    helper_price_mode: str = "standard_real",
 ):
 
     cross_section = df_panel.loc[df_panel["date"] == eval_date].copy()
@@ -1280,7 +1264,7 @@ def run_estimation_for_date_multistart_ns(
     face = 100.0
     redemption = 100.0
 
-    # ---- 1) REFERENCE KPI
+    # ---- 1) REFERENCE KPI + HELPER PRICE PREPARATION
 
     ql_settlement_date = calendar.advance(ql_eval_date, settlement_days, ql.Days)
     settlement_date = pd.Timestamp(
@@ -1289,12 +1273,13 @@ def run_estimation_for_date_multistart_ns(
         ql_settlement_date.dayOfMonth()
     )
 
-    reference_kpi = swedish_reference_kpi(settlement_date, kpi_by_month, lag_months=3)
-
-    # ---- 2) REAL PRICES
-
-    cross_section["index_factor"] = reference_kpi / cross_section["bas_kpi"]
-    cross_section["real_price"] = cross_section["price"] / cross_section["index_factor"]
+    cross_section, reference_kpi, eval_month_kpi, price_col = prepare_helper_prices(
+        cross_section=cross_section,
+        eval_date=eval_date,
+        settlement_date=settlement_date,
+        kpi_by_month=kpi_by_month,
+        helper_price_mode=helper_price_mode,
+    )
 
     # ---- 3) REAL YIELDS
 
@@ -1326,7 +1311,7 @@ def run_estimation_for_date_multistart_ns(
             ql_issue
         )
 
-        price_obj = ql.BondPrice(float(row["real_price"]), ql.BondPrice.Clean)
+        price_obj = ql.BondPrice(float(row["price_for_helper"]), ql.BondPrice.Clean)
 
         ytm_real = ql.BondFunctions.bondYield(
             bond,
@@ -1378,7 +1363,7 @@ def run_estimation_for_date_multistart_ns(
         )
 
         helper = ql.FixedRateBondHelper(
-            ql.QuoteHandle(ql.SimpleQuote(float(row["real_price"]))),
+            ql.QuoteHandle(ql.SimpleQuote(float(row["price_for_helper"]))),
             settlement_days,
             face,
             schedule,
@@ -1391,73 +1376,24 @@ def run_estimation_for_date_multistart_ns(
 
         bonds_actual.append(bond)
         helpers_actual.append(helper)
-        quoted_price_actual.append(float(row["real_price"]))
+        quoted_price_actual.append(float(row["price_for_helper"]))
         yield_real_actual.append(float(row["yield_real"]))
 
     quoted_price_actual = np.array(quoted_price_actual, dtype=float)
     yield_real_actual = np.array(yield_real_actual, dtype=float)
 
-    # ---- 5) 6M REAL T-BILL ANCHOR
-
-    tbill_6m_row = df_tbill_real.loc[
-        (df_tbill_real["date"] == eval_date) &
-        (df_tbill_real["serie"] == "6m_real")
-    ].copy()
-
-    if tbill_6m_row.empty:
-        raise ValueError(f"No 6m real T-bill anchor found for {eval_date.date()}")
-
-    tbill_6m_row = tbill_6m_row.iloc[0]
-
-    real_6m_rate = float(tbill_6m_row["yield_quoted"])
-    real_6m_price = float(tbill_6m_row["price"])
-    real_6m_issue_date = pd.Timestamp(tbill_6m_row["issue_date"])
-    real_6m_maturity_date = pd.Timestamp(tbill_6m_row["maturity_date"])
-
-    real_6m_rate_cc = np.log(1.0 + real_6m_rate)
-
-    # ---- 6) ADD 6M HELPER
-
-    ql_issue_6m = ql.Date(real_6m_issue_date.day, real_6m_issue_date.month, real_6m_issue_date.year)
-    ql_maturity_6m = ql.Date(real_6m_maturity_date.day, real_6m_maturity_date.month, real_6m_maturity_date.year)
-
-    schedule_6m = ql.Schedule(
-        ql_issue_6m,
-        ql_maturity_6m,
-        ql.Period(ql.Once),
-        calendar,
-        business_convention,
-        business_convention,
-        ql.DateGeneration.Forward,
-        False
-    )
-
-    tbill_6m_helper = ql.FixedRateBondHelper(
-        ql.QuoteHandle(ql.SimpleQuote(real_6m_price)),
-        settlement_days,
-        face,
-        schedule_6m,
-        [0.0],
-        day_count,
-        business_convention,
-        redemption,
-        ql_issue_6m
-    )
-
-    helpers_actual_6m = helpers_actual + [tbill_6m_helper]
-
-    # ---- 7) PRE-CURVE + SYNTHETICS
+    # ---- 5) PRE-CURVE + SYNTHETICS FROM ACTUAL BONDS ONLY
 
     pre_curve = ql.PiecewiseLogCubicDiscount(
         settlement_days,
         calendar,
-        helpers_actual_6m,
+        helpers_actual,
         day_count
     )
     pre_curve.enableExtrapolation()
 
     actual_maturity_dates = sorted({b.maturityDate() for b in bonds_actual})
-    curve_nodes = sorted({ql_maturity_6m, *actual_maturity_dates})
+    curve_nodes = actual_maturity_dates.copy()
 
     synthetic_helpers = []
 
@@ -1504,27 +1440,27 @@ def run_estimation_for_date_multistart_ns(
 
         synthetic_helpers.append(helper)
 
-    helpers_extended = helpers_actual_6m + synthetic_helpers
+    helpers_extended = helpers_actual + synthetic_helpers
 
-    # ---- 8) DEPOSIT-BASED STARTING ANCHOR FOR b0 + b1
+    # ---- 6) DEPOSIT-BASED STARTING ANCHOR FOR b0 + b1
 
-    real_deposit_row = df_real_deposit.loc[df_real_deposit["date"] == eval_date]
+    anchor_1m_row = df_anchor_1m_exp.loc[df_anchor_1m_exp["date"] == eval_date]
 
-    if real_deposit_row.empty:
-        raise ValueError(f"No real deposit anchor found for evaluation date {eval_date.date()}")
+    if anchor_1m_row.empty:
+        raise ValueError(f"No 1m expected-inflation anchor found for evaluation date {eval_date.date()}")
 
-    real_deposit_rate = float(real_deposit_row["real_deposit"].iloc[0])
-    real_deposit_rate_cc = np.log(1.0 + real_deposit_rate)
+    real_1m_exp_rate = float(anchor_1m_row["real_1m_exp"].iloc[0])
+    real_1m_exp_rate_cc = np.log(1.0 + real_1m_exp_rate)
 
-    # ---- 9) ANCHORS
+    # ---- 7) ANCHORS
 
     max_maturity = max(b.maturityDate() for b in bonds_actual)
     long_rate_cc = pre_curve.zeroRate(max_maturity, day_count, ql.Continuous).rate()
 
     b0 = long_rate_cc
-    b1 = real_deposit_rate_cc - b0
+    b1 = real_1m_exp_rate_cc - b0
 
-    # ---- 10) BOUNDS
+    # ---- 8) BOUNDS
 
     b0_min, b0_max = -0.03, 0.06
     b1_min, b1_max = -0.15, 0.15
@@ -1543,15 +1479,15 @@ def run_estimation_for_date_multistart_ns(
 
     constraint = ql.NonhomogeneousBoundaryConstraint(lower, upper)
 
-    # ---- 11) PENALTIES AROUND STARTING VALUES
+    # ---- 9) PENALTIES AROUND STARTING VALUES
 
     l2 = ql.Array(4)
-    l2[0] = 0.05
-    l2[1] = 0.001
+    l2[0] = 10.0
+    l2[1] = 10.0
     l2[2] = 0.2
     l2[3] = 0.05
 
-    # ---- 12) FIT SETUP
+    # ---- 10) FIT SETUP
 
     accuracy = 1.0e-10
     max_evaluations = 10000
@@ -1566,7 +1502,7 @@ def run_estimation_for_date_multistart_ns(
         constraint
     )
 
-    # ---- 13) PRICE ACTUAL BONDS FROM ESTIMATED CURVE
+    # ---- 11) PRICE ACTUAL BONDS FROM ESTIMATED CURVE
 
     def price_actual_bonds(curve):
         curve_handle = ql.YieldTermStructureHandle(curve)
@@ -1582,12 +1518,12 @@ def run_estimation_for_date_multistart_ns(
 
         return np.array(model_prices), np.array(model_yields)
 
-    # ---- 14) MULTISTART GRID
+    # ---- 12) MULTISTART GRID
 
     b2_grid = [-0.02, -0.01, 0.0, 0.01, 0.02]
     tau_grid = [1.5, 2.0, 3.0, 4.5, 6.0]
 
-    # ---- 15) FUNCTION: FIT A SET OF HELPERS
+    # ---- 13) FUNCTION: FIT A SET OF HELPERS
 
     def fit_one_helper_set(helpers, name):
 
@@ -1633,30 +1569,24 @@ def run_estimation_for_date_multistart_ns(
 
         return best_curve, best_params, best_objective, best_start
 
-    # ---- 16) FIT ACTUAL, ACTUAL+6M, AND EXTENDED SETS
+    # ---- 14) FIT ACTUAL, ACTUAL+6M, AND EXTENDED SETS
 
     curve_actual, params_actual, objective_actual, start_actual = fit_one_helper_set(
         helpers_actual, "ACTUAL"
-    )
-    curve_actual_6m, params_actual_6m, objective_actual_6m, start_actual_6m = fit_one_helper_set(
-        helpers_actual_6m, "ACTUAL+6M"
     )
     curve_extended, params_extended, objective_ext, start_ext = fit_one_helper_set(
         helpers_extended, "EXTENDED"
     )
 
-    # ---- 17) PRICE ACTUAL BONDS AND COMPUTE RMSEs
+    # ---- 15) PRICE ACTUAL BONDS AND COMPUTE RMSEs
 
     model_prices_actualfit, model_yields_actualfit = price_actual_bonds(curve_actual)
-    model_prices_actual6mfit, model_yields_actual6mfit = price_actual_bonds(curve_actual_6m)
     model_prices_extendedfit, model_yields_extendedfit = price_actual_bonds(curve_extended)
 
     rmse_price_actualfit = float(
         np.sqrt(np.mean((quoted_price_actual - model_prices_actualfit) ** 2))
     )
-    rmse_price_actual6mfit = float(
-        np.sqrt(np.mean((quoted_price_actual - model_prices_actual6mfit) ** 2))
-    )
+
     rmse_price_extfit = float(
         np.sqrt(np.mean((quoted_price_actual - model_prices_extendedfit) ** 2))
     )
@@ -1664,59 +1594,47 @@ def run_estimation_for_date_multistart_ns(
     rmse_yield_actualfit_bp = float(
         np.sqrt(np.mean((yield_real_actual - model_yields_actualfit) ** 2)) * 1e4
     )
-    rmse_yield_actual6mfit_bp = float(
-        np.sqrt(np.mean((yield_real_actual - model_yields_actual6mfit) ** 2)) * 1e4
-    )
+
     rmse_yield_extfit_bp = float(
         np.sqrt(np.mean((yield_real_actual - model_yields_extendedfit) ** 2)) * 1e4
     )
 
     return {
-        "date": eval_date,
+    "date": eval_date,
 
-        "b0_actual": params_actual[0],
-        "b1_actual": params_actual[1],
-        "b2_actual": params_actual[2],
-        "k1_actual": params_actual[3],
+    "b0_actual": params_actual[0],
+    "b1_actual": params_actual[1],
+    "b2_actual": params_actual[2],
+    "k1_actual": params_actual[3],
 
-        "b0_actual_6m": params_actual_6m[0],
-        "b1_actual_6m": params_actual_6m[1],
-        "b2_actual_6m": params_actual_6m[2],
-        "k1_actual_6m": params_actual_6m[3],
+    "b0_ext": params_extended[0],
+    "b1_ext": params_extended[1],
+    "b2_ext": params_extended[2],
+    "k1_ext": params_extended[3],
 
-        "b0_ext": params_extended[0],
-        "b1_ext": params_extended[1],
-        "b2_ext": params_extended[2],
-        "k1_ext": params_extended[3],
+    "rmse_price_actual": rmse_price_actualfit,
+    "rmse_price_ext": rmse_price_extfit,
 
-        "rmse_price_actual": rmse_price_actualfit,
-        "rmse_price_actual_6m": rmse_price_actual6mfit,
-        "rmse_price_ext": rmse_price_extfit,
+    "rmse_yield_bp_actual": rmse_yield_actualfit_bp,
+    "rmse_yield_bp_ext": rmse_yield_extfit_bp,
 
-        "rmse_yield_bp_actual": rmse_yield_actualfit_bp,
-        "rmse_yield_bp_actual_6m": rmse_yield_actual6mfit_bp,
-        "rmse_yield_bp_ext": rmse_yield_extfit_bp,
+    "objective_actual": objective_actual,
+    "objective_ext": objective_ext,
 
-        "objective_actual": objective_actual,
-        "objective_actual_6m": objective_actual_6m,
-        "objective_ext": objective_ext,
+    "n_bonds": len(helpers_actual),
+    "n_synth": len(synthetic_helpers),
 
-        "n_bonds": len(helpers_actual),
-        "n_synth": len(synthetic_helpers),
+    "real_1m_exp": real_1m_exp_rate,
+    "reference_kpi": reference_kpi,
+    "helper_price_mode": helper_price_mode,
+    "eval_month_kpi": eval_month_kpi,
 
-        "real_deposit": real_deposit_rate,
-        "real_6m": real_6m_rate,
-        "reference_kpi": reference_kpi,
+    "start_b2_actual": start_actual[0],
+    "start_tau_actual": start_actual[1],
 
-        "start_b2_actual": start_actual[0],
-        "start_tau_actual": start_actual[1],
-
-        "start_b2_actual_6m": start_actual_6m[0],
-        "start_tau_actual_6m": start_actual_6m[1],
-
-        "start_b2_ext": start_ext[0],
-        "start_tau_ext": start_ext[1],
-    }
+    "start_b2_ext": start_ext[0],
+    "start_tau_ext": start_ext[1],
+}
 
     # endregion
 
@@ -1740,9 +1658,9 @@ for month, d in month_to_date.items():
     try:
         out = run_estimation_for_date_multistart_ns(
             df_SGBILs,
-            df_real_deposit,
-            df_tbill_real,
-            eval_date
+            df_anchor_1m_exp,
+            eval_date,
+            helper_price_mode=HELPER_PRICE_MODE,
         )
         out["month"] = str(month)
         rows.append(out)
@@ -1763,7 +1681,6 @@ print("Failed months:", len(failed_df))
 # ---- COMPUTE TAU
 
 results["tau_actual"] = 1.0 / results["k1_actual"]
-results["tau_actual_6m"] = 1.0 / results["k1_actual_6m"]
 results["tau_ext"] = 1.0 / results["k1_ext"]
 
 # ---- ARRANGE AND EXPORT TO EXCEL
@@ -1771,32 +1688,21 @@ results["tau_ext"] = 1.0 / results["k1_ext"]
 col_order = [
     "date", "month",
 
-    # actual-only params
     "b0_actual", "b1_actual", "b2_actual",
     "k1_actual", "tau_actual",
 
-    # actual + 6m params
-    "b0_actual_6m", "b1_actual_6m", "b2_actual_6m",
-    "k1_actual_6m", "tau_actual_6m",
-
-    # extended params
     "b0_ext", "b1_ext", "b2_ext",
     "k1_ext", "tau_ext",
 
-    # fit diagnostics
-    "rmse_price_actual", "rmse_price_actual_6m", "rmse_price_ext",
-    "rmse_yield_bp_actual", "rmse_yield_bp_actual_6m", "rmse_yield_bp_ext",
-    "objective_actual", "objective_actual_6m", "objective_ext",
+    "rmse_price_actual", "rmse_price_ext",
+    "rmse_yield_bp_actual", "rmse_yield_bp_ext",
+    "objective_actual", "objective_ext",
 
-    # counts
     "n_bonds", "n_synth",
 
-    # anchors / indexation inputs
-    "real_deposit", "real_6m", "reference_kpi",
+    "real_1m_exp", "reference_kpi", "eval_month_kpi", "helper_price_mode",
 
-    # winning starting values
     "start_b2_actual", "start_tau_actual",
-    "start_b2_actual_6m", "start_tau_actual_6m",
     "start_b2_ext", "start_tau_ext",
 ]
 
@@ -1816,19 +1722,16 @@ panel_cols = [
     "b0_actual", "b1_actual", "b2_actual",
     "k1_actual", "tau_actual",
 
-    "b0_actual_6m", "b1_actual_6m", "b2_actual_6m",
-    "k1_actual_6m", "tau_actual_6m",
-
     "b0_ext", "b1_ext", "b2_ext",
     "k1_ext", "tau_ext",
 
-    "rmse_price_actual", "rmse_price_actual_6m", "rmse_price_ext",
-    "rmse_yield_bp_actual", "rmse_yield_bp_actual_6m", "rmse_yield_bp_ext",
+    "rmse_price_actual", "rmse_price_ext",
+    "rmse_yield_bp_actual", "rmse_yield_bp_ext",
 
-    "objective_actual", "objective_actual_6m", "objective_ext",
+    "objective_actual", "objective_ext",
 
     "n_bonds", "n_synth",
-    "real_deposit", "real_6m", "reference_kpi",
+    "real_1m_exp", "reference_kpi",
 ]
 
 print("Panel summary statistics")
@@ -1850,9 +1753,8 @@ results_plot["date"] = pd.to_datetime(results_plot["date"])
 dates = results_plot["date"]
 
 # Colors
-color_ext = "#0B1EFF"        
-color_actual_6m = "#2CA02C" 
-color_actual = "#000000"
+color_ext = "#2CA02C"         
+color_actual = "#3A3A3A"
 
 # Plot settings consistent with cross-sectional figures
 plt.rcParams.update({
@@ -1875,15 +1777,6 @@ ax.plot(
     linewidth=2.0,
     linestyle="-",
     label="Extended"
-)
-
-ax.plot(
-    dates,
-    results_plot["rmse_yield_bp_actual_6m"],
-    color=color_actual_6m,
-    linewidth=2.0,
-    linestyle="-.",
-    label="Actual + 6m real T-bill"
 )
 
 ax.plot(
@@ -1976,7 +1869,7 @@ fit_params = results.loc[:, [
     "rmse_price_ext", "rmse_yield_bp_ext",
     "objective_ext",
     "n_bonds", "n_synth",
-    "real_deposit", "real_6m", "reference_kpi",
+    "real_1m_exp", "reference_kpi",
     "start_b2_ext", "start_tau_ext",
 ]].copy()
 
@@ -2097,5 +1990,227 @@ for ax in (ax1, ax2):
 
 plt.tight_layout()
 plt.show()
+
+# endregion
+
+# region BID-ASK YIELD SPREADS
+
+# 1) start from quoted bid/ask nominal yields,
+# 2) convert to nominal clean prices,
+# 3) deflate by the standard Swedish reference index factor
+#    (3-month lag, linear interpolation at settlement),
+# 4) convert the resulting real clean prices back to real YTMs,
+# 5) summarize the bid-ask spread in bp by date.
+
+def linker_bond_from_row(row, settlement_days=2):
+    day_count = ql.Thirty360(ql.Thirty360.European)
+    tenor = ql.Period(ql.Annual)
+    calendar = ql.Sweden()
+    business_convention = ql.ModifiedFollowing
+    date_gen_rule = ql.DateGeneration.Backward
+    end_of_month = False
+
+    ql_issue = ql.Date(
+        int(row["issue_date"].day),
+        int(row["issue_date"].month),
+        int(row["issue_date"].year)
+    )
+    ql_maturity = ql.Date(
+        int(row["maturity_date"].day),
+        int(row["maturity_date"].month),
+        int(row["maturity_date"].year)
+    )
+
+    schedule = ql.Schedule(
+        ql_issue,
+        ql_maturity,
+        tenor,
+        calendar,
+        business_convention,
+        business_convention,
+        date_gen_rule,
+        end_of_month
+    )
+
+    bond = ql.FixedRateBond(
+        settlement_days,
+        100.0,
+        schedule,
+        [float(row["coupon"])],
+        day_count,
+        business_convention,
+        100.0,
+        ql_issue
+    )
+
+    return bond
+
+
+def quoted_yield_to_nominal_clean_price(
+    row,
+    quoted_yield,
+    ql_settlement_date
+):
+    day_count = ql.Thirty360(ql.Thirty360.European)
+
+    bond = linker_bond_from_row(row)
+
+    clean_price = ql.BondFunctions.cleanPrice(
+        bond,
+        float(quoted_yield),
+        day_count,
+        ql.Compounded,
+        ql.Annual,
+        ql_settlement_date,
+    )
+
+    return float(clean_price)
+
+
+def real_clean_price_from_nominal_clean_price(
+    nominal_clean_price,
+    bas_kpi,
+    reference_kpi
+):
+    index_factor = reference_kpi / float(bas_kpi)
+    return float(nominal_clean_price) / index_factor
+
+
+def real_ytm_from_real_clean_price(
+    row,
+    real_clean_price,
+    ql_settlement_date
+):
+    day_count = ql.Thirty360(ql.Thirty360.European)
+
+    bond = linker_bond_from_row(row)
+
+    price_obj = ql.BondPrice(float(real_clean_price), ql.BondPrice.Clean)
+
+    real_ytm = ql.BondFunctions.bondYield(
+        bond,
+        price_obj,
+        day_count,
+        ql.Compounded,
+        ql.Annual,
+        ql_settlement_date,
+        1.0e-12,
+        1000,
+        0.02
+    )
+
+    return float(real_ytm)
+
+
+def compute_bid_ask_spread_summary_linkers(
+    df_panel: pd.DataFrame,
+    kpi_by_month: pd.Series
+) -> pd.DataFrame:
+    calendar = ql.Sweden()
+    settlement_days = 2
+
+    work = df_panel.copy()
+
+    work = work.dropna(subset=[
+        "date",
+        "issue_date",
+        "maturity_date",
+        "coupon",
+        "bas_kpi",
+        "bid_yield_quoted",
+        "ask_yield_quoted",
+    ]).copy()
+
+    out_rows = []
+
+    for eval_date, g in work.groupby("date", sort=True):
+        ql_eval_date = ql.Date(eval_date.day, eval_date.month, eval_date.year)
+        ql_settlement_date = calendar.advance(ql_eval_date, settlement_days, ql.Days)
+
+        settlement_date = pd.Timestamp(
+            ql_settlement_date.year(),
+            ql_settlement_date.month(),
+            ql_settlement_date.dayOfMonth()
+        )
+
+        # Use the standard market-convention reference KPI:
+        # 3-month lag with linear interpolation.
+        reference_kpi = swedish_reference_kpi(
+            settlement_date=settlement_date,
+            kpi_by_month=kpi_by_month,
+            lag_months=3
+        )
+
+        spreads_bp = []
+
+        for _, row in g.iterrows():
+            try:
+                bid_nominal_clean = quoted_yield_to_nominal_clean_price(
+                    row=row,
+                    quoted_yield=row["bid_yield_quoted"],
+                    ql_settlement_date=ql_settlement_date
+                )
+
+                ask_nominal_clean = quoted_yield_to_nominal_clean_price(
+                    row=row,
+                    quoted_yield=row["ask_yield_quoted"],
+                    ql_settlement_date=ql_settlement_date
+                )
+
+                bid_real_clean = real_clean_price_from_nominal_clean_price(
+                    nominal_clean_price=bid_nominal_clean,
+                    bas_kpi=row["bas_kpi"],
+                    reference_kpi=reference_kpi
+                )
+
+                ask_real_clean = real_clean_price_from_nominal_clean_price(
+                    nominal_clean_price=ask_nominal_clean,
+                    bas_kpi=row["bas_kpi"],
+                    reference_kpi=reference_kpi
+                )
+
+                bid_real_ytm = real_ytm_from_real_clean_price(
+                    row=row,
+                    real_clean_price=bid_real_clean,
+                    ql_settlement_date=ql_settlement_date
+                )
+
+                ask_real_ytm = real_ytm_from_real_clean_price(
+                    row=row,
+                    real_clean_price=ask_real_clean,
+                    ql_settlement_date=ql_settlement_date
+                )
+
+                spread_bp = abs(bid_real_ytm - ask_real_ytm) * 1e4
+                spreads_bp.append(spread_bp)
+
+            except Exception:
+                continue
+
+        if len(spreads_bp) == 0:
+            out_rows.append({
+                "date": eval_date,
+                "median_bid_ask_yield_spread_bp": np.nan,
+                "mean_bid_ask_yield_spread_bp": np.nan,
+                "n_bonds": 0,
+            })
+        else:
+            out_rows.append({
+                "date": eval_date,
+                "median_bid_ask_yield_spread_bp": float(np.median(spreads_bp)),
+                "mean_bid_ask_yield_spread_bp": float(np.mean(spreads_bp)),
+                "n_bonds": int(len(spreads_bp)),
+            })
+
+    return pd.DataFrame(out_rows).sort_values("date").reset_index(drop=True)
+
+
+df_linker_bid_ask_summary = compute_bid_ask_spread_summary_linkers(
+    df_panel=df_SGBILs,
+    kpi_by_month=kpi_by_month
+)
+
+print(df_linker_bid_ask_summary.tail())
+df_linker_bid_ask_summary.to_excel("inflation_linked_bid_ask.xlsx", index=False)
 
 # endregion
