@@ -9,6 +9,10 @@ short_rates = pd.read_excel("statsobligationer_data.xlsx", sheet_name = "korta r
 
 START = pd.Timestamp("2000-01-01")
 END = pd.Timestamp("2026-01-31")
+ENTER_DATE = "2022-04-19"
+
+MAX_MAT = 15
+MIN_MAT = 90
 
 # region PREPARE BOND DATA
 
@@ -62,7 +66,7 @@ df_SGBs = df_SGBs.sort_values(["date", "maturity_date"]).reset_index(drop=True)
 
 # Filter bonds with less than 90 days and more than approx 15 years to maturity:
 time_to_maturity = (df_SGBs["maturity_date"] - df_SGBs["date"]).dt.days
-df_SGBs = df_SGBs[(time_to_maturity >= 90) & (time_to_maturity <= 15 * 365)]
+df_SGBs = df_SGBs[(time_to_maturity >= MIN_MAT) & (time_to_maturity <= MAX_MAT * 365)]
 df_SGBs = df_SGBs.reset_index(drop=True)
 
 # ---- 2) PREPARE SHORT RATE DATA
@@ -117,15 +121,30 @@ df_SGBs = df_SGBs.drop(columns=["month"])
 df_SSVX = df_SSVX.drop(columns=["month"])
 
 # Align dataframes:
-required_cols = ["date", "price", "yield", "coupon", "issue_date", "maturity_date", "isin", "serie"]
+required_cols = [
+    "date",
+    "price",
+    "yield",
+    "coupon",
+    "issue_date",
+    "maturity_date",
+    "isin",
+    "serie",
+    "bid_yield",
+    "ask_yield",
+]
+
 df_SGBs = df_SGBs.loc[:, required_cols].copy()
+
+df_SSVX["bid_yield"] = np.nan
+df_SSVX["ask_yield"] = np.nan
 df_SSVX = df_SSVX.loc[:, required_cols].copy()
 
 for c in ["date", "issue_date", "maturity_date"]:
     df_SGBs[c] = pd.to_datetime(df_SGBs[c], errors="coerce")
     df_SSVX[c] = pd.to_datetime(df_SSVX[c], errors="coerce")
 
-for c in ["price", "yield", "coupon"]:
+for c in ["price", "yield", "coupon", "bid_yield", "ask_yield"]:
     df_SGBs[c] = pd.to_numeric(df_SGBs[c], errors="coerce")
     df_SSVX[c] = pd.to_numeric(df_SSVX[c], errors="coerce")
 
@@ -157,7 +176,6 @@ df_deposit = df_deposit.drop(columns=["month"]).dropna(subset=["date"]).sort_val
 
 # ---- 1) SETTINGS
 
-ENTER_DATE = "2002-05-31"
 eval_date = pd.Timestamp(ENTER_DATE)
 cross_section = df_SGBs.loc[df_SGBs["date"] == eval_date].copy()
 cross_section = cross_section.sort_values("maturity_date").reset_index(drop=True)
@@ -1266,8 +1284,8 @@ results_plot["date"] = pd.to_datetime(results_plot["date"])
 dates = results_plot["date"]
 
 # Colors
-color_ext = "#0B1EFF"
-color_actual = "#000000"
+color_ext = "#2CA02C"         
+color_actual = "#3A3A3A"
 
 # Plot settings consistent with cross-sectional figures
 plt.rcParams.update({
@@ -1558,5 +1576,39 @@ with pd.ExcelWriter("statsobligationer_data.xlsx", engine="openpyxl", mode="w") 
         df_sheet.to_excel(writer, sheet_name=sheet_name, index=False)
 
 print("Updated statsobligationer_data.xlsx")
+
+# endregion
+
+# region BID-ASK YIELD SPREADS
+
+def compute_bid_ask_spread_summary_nominal(df_panel: pd.DataFrame) -> pd.DataFrame:
+    spread_df = df_panel.copy()
+
+    # Keep actual nominal bond observations only:
+    # SSVX synthetic short instruments have missing bid/ask yields.
+    spread_df = spread_df.dropna(subset=["bid_yield", "ask_yield"]).copy()
+
+    spread_df["bid_ask_spread_bp"] = (
+        (spread_df["bid_yield"] - spread_df["ask_yield"]).abs() * 1e4
+    )
+
+    summary = (
+        spread_df.groupby("date", as_index=False)["bid_ask_spread_bp"]
+        .agg(
+            median_bid_ask_yield_spread_bp="median",
+            mean_bid_ask_yield_spread_bp="mean",
+            n_bonds="count",
+        )
+        .sort_values("date")
+        .reset_index(drop=True)
+    )
+
+    return summary
+
+
+df_nominal_bid_ask_summary = compute_bid_ask_spread_summary_nominal(df_SGBs)
+
+print(df_nominal_bid_ask_summary.tail())
+df_nominal_bid_ask_summary.to_excel("nominal_bid_ask.xlsx", index=False)
 
 # endregion
