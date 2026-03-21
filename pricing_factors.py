@@ -1094,11 +1094,180 @@ with pd.ExcelWriter("price_factors.xlsx", engine="openpyxl", mode="a", if_sheet_
 
 # endregion
 
+# region COMPOSITE LIQUIDITY
+
+# ---- 1) IMPORT LIQUIDITY SHEET
+liq = pd.read_excel("price_factors.xlsx", sheet_name="liquidity")
+liq["date"] = pd.to_datetime(liq["date"], errors="coerce")
+
+# Keep only the needed columns and sort
+liq = liq.loc[:, ["date", "bid_ask_ratio", "turnover_ratio_ma3", "linked_rmse_yield_bp"]].copy()
+liq = liq.sort_values("date").reset_index(drop=True)
+
+# ---- 2) CLEAN / NUMERIC CONVERSION
+base_cols = ["bid_ask_ratio", "turnover_ratio_ma3", "linked_rmse_yield_bp"]
+
+for col in base_cols:
+    liq[col] = pd.to_numeric(liq[col], errors="coerce")
+
+# ---- 3) STANDARDIZE EACH SERIES
+liq_std = liq.copy()
+
+for col in base_cols:
+    col_mean = liq_std[col].mean()
+    col_std = liq_std[col].std()
+    liq_std[col] = (liq_std[col] - col_mean) / col_std
+
+# ---- 4) COMPUTE EQUAL-WEIGHT COMPOSITE
+liq_std["composite_liquidity_raw"] = liq_std[base_cols].mean(axis=1)
+
+# Ensure positivity as in the paper
+composite_min = liq_std["composite_liquidity_raw"].min()
+liq_std["composite_liquidity"] = liq_std["composite_liquidity_raw"] - composite_min
+
+# ---- 5) PLOT STANDARDIZED INPUT SERIES (STACKED)
+fig, axes = plt.subplots(3, 1, figsize=(13, 12), sharex=True)
+fig.patch.set_facecolor("white")
+
+color_blue   = "#1f3b73"
+color_orange = "#d88a34"
+color_green  = "#2f6b3f"
+
+series_info = [
+    ("bid_ask_ratio",        "Bid-ask ratio (std.)",         color_blue),
+    ("linked_rmse_yield_bp", "SGBi yield RMSE (std.)",       color_orange),
+    ("turnover_ratio_ma3",   "Turnover ratio, 3m MA (std.)", color_green),
+]
+
+for ax, (col, label, color) in zip(axes, series_info):
+    ax.set_facecolor("white")
+
+    ax.plot(
+        liq_std["date"],
+        liq_std[col],
+        color=color,
+        linewidth=2.4
+    )
+
+    ax.axhline(0.0, color="black", linestyle="--", linewidth=1.0)
+    ax.set_ylabel(label, fontsize=11)
+
+    for spine in ax.spines.values():
+        spine.set_linewidth(1.0)
+        spine.set_color("black")
+
+    ax.tick_params(
+        axis="both",
+        which="major",
+        direction="in",
+        top=True,
+        right=True,
+        length=5,
+        width=1.0
+    )
+
+    ax.grid(axis="y", linestyle="--", linewidth=0.7, alpha=0.4)
+
+axes[-1].set_xlim(pd.Timestamp("2004-01-01"), pd.Timestamp("2025-12-31"))
+axes[-1].set_xticks([pd.Timestamp(f"{year}-01-01") for year in [2005, 2010, 2015, 2020, 2025]])
+axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+axes[-1].tick_params(axis="x", rotation=45)
+
+plt.tight_layout()
+plt.show()
+
+# ---- 6) PLOT COMPOSITE LIQUIDITY INDEX
+fig, ax = plt.subplots(figsize=(13, 7))
+fig.patch.set_facecolor("white")
+ax.set_facecolor("white")
+
+# Bright but still muted green
+color_green = "#4c9a6a"
+
+# Line
+ax.plot(
+    liq_std["date"],
+    liq_std["composite_liquidity"],
+    color=color_green,
+    linewidth=2.5
+)
+
+# Filled area (from 0 up to the series)
+ax.fill_between(
+    liq_std["date"],
+    0,
+    liq_std["composite_liquidity"],
+    color=color_green,
+    alpha=0.25
+)
+
+ax.set_xlabel("")
+ax.set_ylabel("Composite liquidity index", fontsize=12)
+
+for spine in ax.spines.values():
+    spine.set_linewidth(1.0)
+    spine.set_color("black")
+
+ax.tick_params(
+    axis="both",
+    which="major",
+    direction="in",
+    top=True,
+    right=True,
+    length=5,
+    width=1.0
+)
+
+ax.set_xlim(pd.Timestamp("2004-01-01"), pd.Timestamp("2025-12-31"))
+ax.set_xticks([pd.Timestamp(f"{year}-01-01") for year in [2005, 2010, 2015, 2020, 2025]])
+ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+ax.tick_params(axis="x", rotation=45)
+
+ax.grid(axis="y", linestyle="--", linewidth=0.7, alpha=0.4)
+ax.margins(x=0)
+
+plt.tight_layout()
+plt.show()
+
+# ---- 7) EXPORT COMPOSITE BACK TO THE LIQUIDITY SHEET
+# Merge only the final composite into the existing liquidity sheet
+liquidity_export = pd.read_excel("price_factors.xlsx", sheet_name="liquidity")
+liquidity_export["date"] = pd.to_datetime(liquidity_export["date"], errors="coerce")
+
+composite_export = liq_std.loc[:, ["date", "composite_liquidity"]].copy()
+
+# Remove existing composite_liquidity if already present, then merge fresh version
+if "composite_liquidity" in liquidity_export.columns:
+    liquidity_export = liquidity_export.drop(columns=["composite_liquidity"])
+
+liquidity_export = pd.merge(
+    liquidity_export,
+    composite_export,
+    on="date",
+    how="left"
+)
+
+# Put composite_liquidity at the far right
+liquidity_export["date"] = liquidity_export["date"].dt.date
+
+with pd.ExcelWriter("price_factors.xlsx", engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
+    liquidity_export.to_excel(writer, sheet_name="liquidity", index=False)
+
+
+# endregion
+
 # region NOMINAL PRINCIPAL COMPONENTS
 
 # ---- 1) PREPARE NOMINAL YIELD PANEL
 
+start_date = pd.Timestamp("2004-01-01")
+end_date   = pd.Timestamp("2025-12-31")
+
+tick_years = [2005, 2010, 2015, 2020, 2025]
+tick_dates = [pd.Timestamp(f"{year}-01-01") for year in tick_years]
+
 nominal_pca_cols = [
+    "y_3m",
     "y_6m",
     "y_12m",
     "y_24m",
@@ -1112,9 +1281,9 @@ nominal_pca_cols = [
     "y_120m",
 ]
 
-maturity_months = [6, 12, 24, 36, 48, 60, 72, 84, 96, 108, 120]
+maturity_months = [3, 6, 12, 24, 36, 48, 60, 72, 84, 96, 108, 120]
 maturity_years = [m / 12 for m in maturity_months]
-maturity_labels_years = ["0.5", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]
+maturity_labels_years = ["0.25", "0.5", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]
 
 nominal_pca_df = fitted_zero_SGB.loc[
     (fitted_zero_SGB["date"] >= start_date) &
@@ -1336,4 +1505,331 @@ with pd.ExcelWriter("price_factors.xlsx", engine="openpyxl", mode="a", if_sheet_
 
 # endregion
 
+# region LINKED ORHTOGONAL PRINCIPAL COMPONENTS
 
+# ---- 1) PREPARE LINKED YIELD PANEL
+# Paper-consistent maturity range for linked yields: 24m to 120m
+
+linked_pca_cols = [
+    "y_24m",
+    "y_36m",
+    "y_48m",
+    "y_60m",
+    "y_72m",
+    "y_84m",
+    "y_96m",
+    "y_108m",
+    "y_120m",
+]
+
+linked_maturity_months = [24, 36, 48, 60, 72, 84, 96, 108, 120]
+linked_maturity_years = [m / 12 for m in linked_maturity_months]
+linked_maturity_labels_years = ["2", "3", "4", "5", "6", "7", "8", "9", "10"]
+
+linked_panel = fitted_zero_SGBIL.loc[
+    (fitted_zero_SGBIL["date"] >= start_date) &
+    (fitted_zero_SGBIL["date"] <= end_date),
+    ["date"] + linked_pca_cols
+].copy()
+
+# ---- 2) PREPARE NOMINAL PCS + LIQUIDITY FACTOR
+nominal_factors = nominal_pca_df.loc[:, ["date", "pc1", "pc2", "pc3"]].copy()
+
+liquidity_factor = liq_std.loc[:, ["date", "composite_liquidity"]].copy()
+
+# ---- 3) MERGE EVERYTHING ON DATE
+linked_reg_df = pd.merge(linked_panel, nominal_factors, on="date", how="inner")
+linked_reg_df = pd.merge(linked_reg_df, liquidity_factor, on="date", how="inner")
+
+linked_reg_df = linked_reg_df.dropna().sort_values("date").reset_index(drop=True)
+
+# ---- 4) ORTHOGONALIZE LINKED YIELDS
+# Regress each linked yield maturity on:
+# constant + nominal PC1 + nominal PC2 + nominal PC3 + liquidity factor
+# Then keep residuals.
+
+X = linked_reg_df[["pc1", "pc2", "pc3", "composite_liquidity"]].to_numpy()
+X = np.column_stack([np.ones(len(X)), X])   # add intercept
+
+residuals = np.empty((len(linked_reg_df), len(linked_pca_cols)))
+
+for j, col in enumerate(linked_pca_cols):
+    y = linked_reg_df[col].to_numpy()
+    beta, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
+    y_hat = X @ beta
+    residuals[:, j] = y - y_hat
+
+residual_df = pd.DataFrame(residuals, columns=[f"{c}_resid" for c in linked_pca_cols])
+residual_df.insert(0, "date", linked_reg_df["date"].values)
+
+# ---- 5) PCA ON RESIDUALS
+pca_linked = PCA(n_components=2)
+scores_linked = pca_linked.fit_transform(residuals)
+
+explained_var_ratio_linked = pca_linked.explained_variance_ratio_
+loadings_linked = pca_linked.components_.copy()
+
+linked_pca_df = linked_reg_df.loc[:, ["date"]].copy()
+linked_pca_df["real_pc1"] = scores_linked[:, 0]
+linked_pca_df["real_pc2"] = scores_linked[:, 1]
+
+print("Orthogonal linked yield PCA variance shares")
+print(f"Real PC1: {explained_var_ratio_linked[0]:.2%}")
+print(f"Real PC2: {explained_var_ratio_linked[1]:.2%}")
+
+# ---- 7) PLOT LOADINGS BY MATURITY
+fig, ax = plt.subplots(figsize=(13, 7))
+fig.patch.set_facecolor("white")
+ax.set_facecolor("white")
+
+ax.plot(
+    linked_maturity_years,
+    loadings_linked[0, :],
+    color="#1f3b73",
+    linewidth=2.2,
+    linestyle="-",
+    marker="o",
+    markersize=5,
+    label=f"Real PC1: variance explained {explained_var_ratio_linked[0]:.1%}"
+)
+
+ax.plot(
+    linked_maturity_years,
+    loadings_linked[1, :],
+    color="#d88a34",
+    linewidth=2.2,
+    linestyle="-",
+    marker="o",
+    markersize=5,
+    label=f"Real PC2: variance explained {explained_var_ratio_linked[1]:.1%}"
+)
+
+ax.axhline(0.0, color="black", linestyle="--", linewidth=1.0)
+
+ax.set_xlabel("Maturity (years)", fontsize=12)
+ax.set_ylabel("PCA loading", fontsize=12)
+
+for spine in ax.spines.values():
+    spine.set_linewidth(1.0)
+    spine.set_color("black")
+
+ax.tick_params(
+    axis="both",
+    which="major",
+    direction="in",
+    top=True,
+    right=True,
+    length=5,
+    width=1.0
+)
+
+ax.set_xticks(linked_maturity_years)
+ax.set_xticklabels(linked_maturity_labels_years, rotation=45)
+
+ax.grid(axis="y", linestyle="--", linewidth=0.7, alpha=0.4)
+ax.margins(x=0.02)
+
+ax.legend(
+    loc="upper right",
+    ncol=1,
+    frameon=True,
+    fancybox=False,
+    edgecolor="black",
+    facecolor="white",
+    framealpha=1.0
+)
+
+fig.tight_layout()
+plt.show()
+
+# ---- 8) PLOT EVOLUTION OF THE TWO ORTHOGONAL LINKED PCs
+fig, ax = plt.subplots(figsize=(13, 7))
+fig.patch.set_facecolor("white")
+ax.set_facecolor("white")
+
+ax.plot(
+    linked_pca_df["date"],
+    linked_pca_df["real_pc1"],
+    color="#1f3b73",
+    linewidth=2.2,
+    linestyle="-",
+    label="Real PC1"
+)
+
+ax.plot(
+    linked_pca_df["date"],
+    linked_pca_df["real_pc2"],
+    color="#d88a34",
+    linewidth=2.2,
+    linestyle="-",
+    label="Real PC2"
+)
+
+ax.axhline(0.0, color="black", linestyle="--", linewidth=1.0)
+
+ax.set_xlabel("")
+ax.set_ylabel("Principal component score", fontsize=12)
+
+for spine in ax.spines.values():
+    spine.set_linewidth(1.0)
+    spine.set_color("black")
+
+ax.tick_params(
+    axis="both",
+    which="major",
+    direction="in",
+    top=True,
+    right=True,
+    length=5,
+    width=1.0
+)
+
+ax.set_xlim(start_date, end_date)
+ax.set_xticks(tick_dates)
+ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+ax.tick_params(axis="x", rotation=45)
+
+ax.grid(axis="y", linestyle="--", linewidth=0.7, alpha=0.4)
+ax.margins(x=0)
+
+ax.legend(
+    loc="upper left",
+    ncol=1,
+    frameon=True,
+    fancybox=False,
+    edgecolor="black",
+    facecolor="white",
+    framealpha=1.0
+)
+
+fig.tight_layout()
+plt.show()
+
+# ---- 9) EXPORT TO EXCEL
+linked_pc_export = linked_pca_df.loc[:, ["date", "real_pc1", "real_pc2"]].copy()
+linked_pc_export["date"] = linked_pc_export["date"].dt.date
+
+linked_pca_loadings_export = pd.DataFrame({
+    "maturity_years": linked_maturity_years,
+    "real_pc1_loading": loadings_linked[0, :],
+    "real_pc2_loading": loadings_linked[1, :],
+    "real_pc1_variance_explained": explained_var_ratio_linked[0],
+    "real_pc2_variance_explained": explained_var_ratio_linked[1],
+})
+
+linked_pc_export = linked_pca_df.loc[:, ["date", "real_pc1", "real_pc2"]].copy()
+linked_pc_export["date"] = linked_pc_export["date"].dt.date
+
+with pd.ExcelWriter("price_factors.xlsx", engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
+    linked_pc_export.to_excel(writer, sheet_name="linked PCA", index=False)
+    linked_pca_loadings_export.to_excel(writer, sheet_name="linked PCA loadings", index=False)
+
+# endregion
+
+# region LINKED YIELD R2 SUMMARY
+
+# ---- 1) PREPARE LINKED YIELD PANEL
+linked_yield_cols = [
+    "y_24m",
+    "y_36m",
+    "y_48m",
+    "y_60m",
+    "y_72m",
+    "y_84m",
+    "y_96m",
+    "y_108m",
+    "y_120m",
+]
+
+linked_r2_df = fitted_zero_SGBIL.loc[
+    (fitted_zero_SGBIL["date"] >= start_date) &
+    (fitted_zero_SGBIL["date"] <= end_date),
+    ["date"] + linked_yield_cols
+].copy()
+
+linked_r2_df = pd.merge(
+    linked_r2_df,
+    nominal_pca_df.loc[:, ["date", "pc1", "pc2", "pc3"]],
+    on="date",
+    how="inner"
+)
+
+linked_r2_df = pd.merge(
+    linked_r2_df,
+    liq_std.loc[:, ["date", "composite_liquidity"]],
+    on="date",
+    how="inner"
+)
+
+linked_r2_df = pd.merge(
+    linked_r2_df,
+    linked_pca_df.loc[:, ["date", "real_pc1", "real_pc2"]],
+    on="date",
+    how="inner"
+)
+
+linked_r2_df = linked_r2_df.dropna().sort_values("date").reset_index(drop=True)
+
+# ---- 2) HELPER FUNCTION
+# Runs one OLS per linked-yield maturity and pools SSR and SST across maturities
+def compute_panel_r2(df, y_cols, x_cols):
+    X = df[x_cols].to_numpy()
+    X = np.column_stack([np.ones(len(X)), X])  # intercept
+
+    ssr_total = 0.0
+    sst_total = 0.0
+
+    for col in y_cols:
+        y = df[col].to_numpy()
+        beta, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
+        y_hat = X @ beta
+        resid = y - y_hat
+
+        ssr_total += np.sum(resid ** 2)
+        sst_total += np.sum((y - y.mean()) ** 2)
+
+    r2 = 1.0 - ssr_total / sst_total
+    return r2
+
+# ---- 3) COMPUTE R² BY SPECIFICATION
+r2_spec1 = compute_panel_r2(
+    linked_r2_df,
+    linked_yield_cols,
+    ["pc1", "pc2", "pc3"]
+)
+
+r2_spec2 = compute_panel_r2(
+    linked_r2_df,
+    linked_yield_cols,
+    ["pc1", "pc2", "pc3", "composite_liquidity"]
+)
+
+r2_spec3 = compute_panel_r2(
+    linked_r2_df,
+    linked_yield_cols,
+    ["pc1", "pc2", "pc3", "composite_liquidity", "real_pc1", "real_pc2"]
+)
+
+print("R² for linked yields by specification")
+print(f"1) Nominal PCs only:                 {r2_spec1:.2%}")
+print(f"2) Nominal PCs + liquidity:          {r2_spec2:.2%}")
+print(f"3) Nominal PCs + liquidity + real PCs: {r2_spec3:.2%}")
+
+# ---- 4) EXPORT SUMMARY TO EXCEL
+linked_r2_summary = pd.DataFrame({
+    "specification": [
+        "PC1, PC2, PC3",
+        "PC1, PC2, PC3, Liquidity",
+        "PC1, PC2, PC3, Liquidity, Orthogonal PC1, Orthogonal PC2"
+    ],
+    "r_squared": [
+        r2_spec1,
+        r2_spec2,
+        r2_spec3
+    ]
+})
+
+with pd.ExcelWriter("price_factors.xlsx", engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
+    linked_r2_summary.to_excel(writer, sheet_name="linked yield R2", index=False)
+
+# endregion
