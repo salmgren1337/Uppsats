@@ -2445,9 +2445,9 @@ for _, p in panel_params.iterrows():
     ) ** 2
 
     bucket_defs = {
-        "Below 5 years": cross_section["ttm_years"] < 5.0,
-        "5-10 years": (cross_section["ttm_years"] >= 5.0) & (cross_section["ttm_years"] <= 10.0),
-        "Above 10 years": cross_section["ttm_years"] > 10.0,
+        "Below 4 years": cross_section["ttm_years"] < 4.0,
+        "4-8 years": (cross_section["ttm_years"] >= 4.0) & (cross_section["ttm_years"] <= 8.0),
+        "Above 8 years": cross_section["ttm_years"] > 8.0,
     }
 
     out_row = {"date": eval_date}
@@ -2471,9 +2471,9 @@ fig, axes = plt.subplots(1, 3, figsize=(12.6, 4.4), sharey=True)
 fig.patch.set_facecolor("white")
 
 plot_map = [
-    ("rmse_below_5_years", "Below 5 years"),
-    ("rmse_5_10_years", "5-10 years"),
-    ("rmse_above_10_years", "Above 10 years"),
+    ("rmse_below_4_years", "Below 4 years"),
+    ("rmse_4_8_years", "4-8 years"),
+    ("rmse_above_8_years", "Above 8 years"),
 ]
 
 for ax, (col, title) in zip(axes, plot_map):
