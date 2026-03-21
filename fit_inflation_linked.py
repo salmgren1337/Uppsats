@@ -2,6 +2,7 @@ import pandas as pd
 import QuantLib as ql
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 
 # IMPORTS 
 raw_data_linked = pd.read_excel("statsobligationer_data.xlsx", sheet_name = "SGBi long")
@@ -2214,3 +2215,306 @@ print(df_linker_bid_ask_summary.tail())
 df_linker_bid_ask_summary.to_excel("inflation_linked_bid_ask.xlsx", index=False)
 
 # endregion
+
+# region EXTRA RMSE PLOTS 
+# must run prep > df_SGBILs, kpi_by_month, prepare_helper_prices before
+
+# ---- SETTINGS
+
+RMSE_START = pd.Timestamp("2004-01-30")
+RMSE_END = pd.Timestamp("2025-12-31")
+rmse_color = "#0B3D91"   # deep blue
+
+# Plot settings consistent with the other figures
+plt.rcParams.update({
+    "font.size": 10,
+    "axes.labelsize": 10,
+    "axes.titlesize": 11,
+    "legend.fontsize": 9,
+    "xtick.labelsize": 9,
+    "ytick.labelsize": 9,
+})
+
+# ---- LOAD EXTENDED PARAMETERS FROM PANEL EXCEL
+
+panel_params = pd.read_excel("inflation_linked_panel_results.xlsx", sheet_name="results")
+panel_params["date"] = pd.to_datetime(panel_params["date"], errors="coerce")
+panel_params = panel_params.sort_values("date").reset_index(drop=True)
+
+panel_params = panel_params.loc[
+    (panel_params["date"] >= RMSE_START) &
+    (panel_params["date"] <= RMSE_END)
+].copy()
+
+# ---- NS ZERO-YIELD FUNCTION (CONTINUOUSLY COMPOUNDED)
+
+def ns_zero_yield_cc(t, b0, b1, b2, k1):
+    x1 = k1 * t
+
+    term1 = 1.0 if abs(x1) < 1e-12 else (1.0 - np.exp(-x1)) / x1
+    term2 = term1 - np.exp(-x1)
+
+    return b0 + b1 * term1 + b2 * term2
+
+
+# ---- MODEL YIELD FROM NS PARAMETERS
+
+def model_real_yield_from_ns(row, eval_date, b0, b1, b2, k1):
+    ql_eval_date = ql.Date(eval_date.day, eval_date.month, eval_date.year)
+    ql.Settings.instance().evaluationDate = ql_eval_date
+
+    day_count = ql.Thirty360(ql.Thirty360.European)
+    tenor = ql.Period(ql.Annual)
+    calendar = ql.Sweden()
+    business_convention = ql.ModifiedFollowing
+    date_gen_rule = ql.DateGeneration.Backward
+    end_of_month = False
+
+    settlement_days = 2
+    face = 100.0
+    redemption = 100.0
+
+    ql_issue = ql.Date(row["issue_date"].day, row["issue_date"].month, row["issue_date"].year)
+    ql_maturity = ql.Date(row["maturity_date"].day, row["maturity_date"].month, row["maturity_date"].year)
+
+    schedule = ql.Schedule(
+        ql_issue,
+        ql_maturity,
+        tenor,
+        calendar,
+        business_convention,
+        business_convention,
+        date_gen_rule,
+        end_of_month
+    )
+
+    bond = ql.FixedRateBond(
+        settlement_days,
+        face,
+        schedule,
+        [float(row["coupon"])],
+        day_count,
+        business_convention,
+        redemption,
+        ql_issue
+    )
+
+    settlement_date = bond.settlementDate()
+
+    dirty_price = 0.0
+    for cf in bond.cashflows():
+        if cf.hasOccurred(settlement_date):
+            continue
+
+        cf_date = cf.date()
+        t = day_count.yearFraction(settlement_date, cf_date)
+        if t <= 0.0:
+            continue
+
+        z = ns_zero_yield_cc(t, b0, b1, b2, k1)
+        df = np.exp(-z * t)
+        dirty_price += cf.amount() * df
+
+    accrued = bond.accruedAmount(settlement_date)
+    clean_price = dirty_price - accrued
+
+    price_obj = ql.BondPrice(clean_price, ql.BondPrice.Clean)
+
+    model_yield = ql.BondFunctions.bondYield(
+        bond,
+        price_obj,
+        day_count,
+        ql.Compounded,
+        ql.Annual,
+        settlement_date,
+        1.0e-12,
+        1000,
+        0.02
+    )
+
+    return float(model_yield)
+
+
+# ---- COMPUTE REAL-YIELD RMSEs BY DATE AND MATURITY BUCKET
+
+bucket_rows = []
+
+for _, p in panel_params.iterrows():
+    eval_date = pd.Timestamp(p["date"])
+
+    cross_section = df_SGBILs.loc[df_SGBILs["date"] == eval_date].copy()
+    cross_section = cross_section.loc[cross_section["bas_kpi"].notna()].copy()
+    cross_section = cross_section.sort_values("maturity_date").reset_index(drop=True)
+
+    if cross_section.empty:
+        continue
+
+    ql_eval_date = ql.Date(eval_date.day, eval_date.month, eval_date.year)
+    calendar = ql.Sweden()
+    settlement_days = 2
+    ql_settlement_date = calendar.advance(ql_eval_date, settlement_days, ql.Days)
+
+    settlement_date = pd.Timestamp(
+        ql_settlement_date.year(),
+        ql_settlement_date.month(),
+        ql_settlement_date.dayOfMonth()
+    )
+
+    # same helper-price treatment as in the fit
+    cross_section, _, _, _ = prepare_helper_prices(
+        cross_section=cross_section,
+        eval_date=eval_date,
+        settlement_date=settlement_date,
+        kpi_by_month=kpi_by_month,
+        helper_price_mode=HELPER_PRICE_MODE,
+    )
+
+    # observed real yields from helper prices
+    observed_real_yields = []
+
+    for _, row in cross_section.iterrows():
+        day_count = ql.Thirty360(ql.Thirty360.European)
+        tenor = ql.Period(ql.Annual)
+        business_convention = ql.ModifiedFollowing
+        date_gen_rule = ql.DateGeneration.Backward
+        end_of_month = False
+        face = 100.0
+        redemption = 100.0
+
+        ql_issue = ql.Date(row["issue_date"].day, row["issue_date"].month, row["issue_date"].year)
+        ql_maturity = ql.Date(row["maturity_date"].day, row["maturity_date"].month, row["maturity_date"].year)
+
+        schedule = ql.Schedule(
+            ql_issue,
+            ql_maturity,
+            tenor,
+            calendar,
+            business_convention,
+            business_convention,
+            date_gen_rule,
+            end_of_month
+        )
+
+        bond = ql.FixedRateBond(
+            settlement_days,
+            face,
+            schedule,
+            [float(row["coupon"])],
+            day_count,
+            business_convention,
+            redemption,
+            ql_issue
+        )
+
+        price_obj = ql.BondPrice(float(row["price_for_helper"]), ql.BondPrice.Clean)
+
+        ytm_real = ql.BondFunctions.bondYield(
+            bond,
+            price_obj,
+            day_count,
+            ql.Compounded,
+            ql.Annual,
+            ql_settlement_date,
+            1.0e-12,
+            1000,
+            0.02
+        )
+
+        observed_real_yields.append(float(ytm_real))
+
+    cross_section["yield_real"] = np.array(observed_real_yields, dtype=float)
+
+    # model-implied real yields from extended-fit parameters
+    model_yields = []
+    for _, bond_row in cross_section.iterrows():
+        y_model = model_real_yield_from_ns(
+            bond_row,
+            eval_date,
+            p["b0_ext"], p["b1_ext"], p["b2_ext"], p["k1_ext"]
+        )
+        model_yields.append(y_model)
+
+    cross_section["model_yield_ext"] = np.array(model_yields, dtype=float)
+
+    cross_section["ttm_years"] = (
+        (cross_section["maturity_date"] - cross_section["date"]).dt.days / 365.25
+    )
+
+    cross_section["sq_err_bp2"] = (
+        (cross_section["yield_real"] - cross_section["model_yield_ext"]) * 1e4
+    ) ** 2
+
+    bucket_defs = {
+        "Below 5 years": cross_section["ttm_years"] < 5.0,
+        "5-10 years": (cross_section["ttm_years"] >= 5.0) & (cross_section["ttm_years"] <= 10.0),
+        "Above 10 years": cross_section["ttm_years"] > 10.0,
+    }
+
+    out_row = {"date": eval_date}
+
+    for bucket_name, mask in bucket_defs.items():
+        g = cross_section.loc[mask]
+        col_name = bucket_name.lower().replace(" ", "_").replace("-", "_")
+
+        if len(g) == 0:
+            out_row[f"rmse_{col_name}"] = np.nan
+        else:
+            out_row[f"rmse_{col_name}"] = float(np.sqrt(g["sq_err_bp2"].mean()))
+
+    bucket_rows.append(out_row)
+
+rmse_bucket_df = pd.DataFrame(bucket_rows).sort_values("date").reset_index(drop=True)
+
+# ---- PLOT: THREE SQUARE SUBPLOTS SIDE BY SIDE
+
+fig, axes = plt.subplots(1, 3, figsize=(12.6, 4.4), sharey=True)
+fig.patch.set_facecolor("white")
+
+plot_map = [
+    ("rmse_below_5_years", "Below 5 years"),
+    ("rmse_5_10_years", "5-10 years"),
+    ("rmse_above_10_years", "Above 10 years"),
+]
+
+for ax, (col, title) in zip(axes, plot_map):
+    ax.set_facecolor("white")
+
+    ax.plot(
+        rmse_bucket_df["date"],
+        rmse_bucket_df[col],
+        color=rmse_color,
+        linewidth=1.8,
+        linestyle="-"
+    )
+
+    ax.set_title(title, pad=10)
+    ax.set_xlabel("Date")
+    ax.set_box_aspect(1)
+
+    for spine in ax.spines.values():
+        spine.set_linewidth(1.0)
+        spine.set_color("black")
+
+    ax.tick_params(
+        axis="both",
+        which="major",
+        direction="in",
+        top=True,
+        right=True,
+        length=5,
+        width=1.0,
+        pad=6
+    )
+
+    ax.grid(axis="y", linestyle="--", linewidth=0.7, alpha=0.45)
+    ax.set_xlim(RMSE_START, RMSE_END)
+    ax.xaxis.set_major_locator(mdates.YearLocator(5))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+
+axes[0].set_ylabel("Real-yield RMSE (bp)")
+
+plt.tight_layout()
+plt.show()
+
+# endregion
+
